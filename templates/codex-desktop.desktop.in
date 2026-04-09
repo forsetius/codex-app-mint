@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Codex Desktop
+Comment=Temporary Linux Mint launcher for Codex App
+Exec=__EXEC__
+Icon=__ICON__
+Terminal=false
+Categories=Development;
+StartupNotify=true
+StartupWMClass=codex-desktop
+Keywords=OpenAI;Codex;AI;Assistant;
