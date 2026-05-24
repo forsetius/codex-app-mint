@@ -16,7 +16,10 @@ DEFAULT_DMG_PATH="$CACHE_DIR/Codex.dmg"
 DMG_PATH=""
 DMG_URL="${CODEX_DMG_URL:-https://persistent.oaistatic.com/codex-app-prod/Codex.dmg}"
 ELECTRON_VERSION="${CODEX_ELECTRON_VERSION:-40.0.0}"
-DESKTOP_FILE_PATH="${CODEX_DESKTOP_FILE_PATH:-$HOME/.local/share/applications/codex-desktop.desktop}"
+DESKTOP_INSTALL_SCOPE="${CODEX_DESKTOP_INSTALL_SCOPE:-system}"
+DESKTOP_FILE_PATH=""
+SYSTEM_DESKTOP_FILE_PATH="/usr/share/applications/codex-desktop.desktop"
+USER_DESKTOP_FILE_PATH="$HOME/.local/share/applications/codex-desktop.desktop"
 
 FRESH_INSTALL=0
 INSTALL_DESKTOP_ENTRY=1
@@ -57,7 +60,9 @@ No updater, no system-wide package installation for the app itself.
 Options:
   --dmg PATH                 Use an existing Codex.dmg instead of downloading it.
   --fresh                    Remove the generated runtime and cached downloads first.
-  --skip-desktop-entry       Do not install or refresh ~/.local/share/applications/codex-desktop.desktop.
+  --skip-desktop-entry       Do not install or refresh the desktop entry.
+  --system-desktop-entry     Install to /usr/share/applications (default; requires sudo).
+  --user-desktop-entry       Install to ~/.local/share/applications instead.
   -h, --help                 Show this help and exit.
 
 Environment variables:
@@ -67,7 +72,34 @@ Environment variables:
   CODEX_PORT_INSTALL_DIR     Override the app install directory (default: ./runtime/codex-app).
   CODEX_PORT_CACHE_DIR       Override the cache directory (default: ./runtime/cache).
   CODEX_DESKTOP_FILE_PATH    Override the installed desktop entry path.
+  CODEX_DESKTOP_INSTALL_SCOPE  system (default) or user — where to install the .desktop file.
 EOF
+}
+
+resolve_desktop_file_path() {
+  if [ -n "${CODEX_DESKTOP_FILE_PATH:-}" ]; then
+    DESKTOP_FILE_PATH="$CODEX_DESKTOP_FILE_PATH"
+    return 0
+  fi
+
+  case "$DESKTOP_INSTALL_SCOPE" in
+    system)
+      DESKTOP_FILE_PATH="$SYSTEM_DESKTOP_FILE_PATH"
+      ;;
+    user)
+      DESKTOP_FILE_PATH="$USER_DESKTOP_FILE_PATH"
+      ;;
+    *)
+      error "Invalid CODEX_DESKTOP_INSTALL_SCOPE: $DESKTOP_INSTALL_SCOPE (use system or user)"
+      ;;
+  esac
+}
+
+desktop_entry_needs_root() {
+  case "$DESKTOP_FILE_PATH" in
+    /usr/*|/usr/local/*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 dependency_help() {
@@ -95,6 +127,12 @@ parse_args() {
         ;;
       --skip-desktop-entry)
         INSTALL_DESKTOP_ENTRY=0
+        ;;
+      --system-desktop-entry)
+        DESKTOP_INSTALL_SCOPE=system
+        ;;
+      --user-desktop-entry)
+        DESKTOP_INSTALL_SCOPE=user
         ;;
       -h|--help)
         usage
@@ -351,6 +389,53 @@ install_app_files() {
   fi
 }
 
+detect_codex_cli() {
+  local candidate=""
+  local nvm_version=""
+
+  if [ -n "${CODEX_CLI_PATH:-}" ] && [ -x "${CODEX_CLI_PATH}" ]; then
+    printf '%s\n' "$CODEX_CLI_PATH"
+    return 0
+  fi
+
+  if command -v codex >/dev/null 2>&1; then
+    command -v codex
+    return 0
+  fi
+
+  if [ -r "$HOME/.nvm/alias/default" ]; then
+    nvm_version="$(tr -d '[:space:]' < "$HOME/.nvm/alias/default")"
+    candidate="$HOME/.nvm/versions/node/${nvm_version}/bin/codex"
+    if [ -x "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  fi
+
+  if [ -d "$HOME/.nvm/versions/node" ]; then
+    while IFS= read -r candidate; do
+      if [ -x "$candidate" ]; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    done < <(find "$HOME/.nvm/versions/node" -maxdepth 3 -path '*/bin/codex' -type f 2>/dev/null | sort -V -r)
+  fi
+
+  for candidate in \
+    "$HOME/.local/bin/codex" \
+    "$HOME/.local/share/pnpm/codex" \
+    /usr/local/bin/codex \
+    /usr/bin/codex
+  do
+    if [ -x "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 create_launcher() {
   cat > "$INSTALL_DIR/start.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -364,10 +449,10 @@ WEBVIEW_PID_FILE="$STATE_DIR/webview.pid"
 LAUNCHER_LOG_FILE="$LOG_DIR/launcher.log"
 
 mkdir -p "$STATE_DIR" "$LOG_DIR"
-exec >>"$LAUNCHER_LOG_FILE" 2>&1
 
 resolve_codex_cli() {
   local candidate=""
+  local nvm_version=""
 
   if [ -n "${CODEX_CLI_PATH:-}" ] && [ -x "${CODEX_CLI_PATH}" ]; then
     printf '%s\n' "$CODEX_CLI_PATH"
@@ -379,8 +464,25 @@ resolve_codex_cli() {
     return 0
   fi
 
+  if [ -r "$HOME/.nvm/alias/default" ]; then
+    nvm_version="$(tr -d '[:space:]' < "$HOME/.nvm/alias/default")"
+    candidate="$HOME/.nvm/versions/node/${nvm_version}/bin/codex"
+    if [ -x "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  fi
+
+  if [ -d "$HOME/.nvm/versions/node" ]; then
+    while IFS= read -r candidate; do
+      if [ -x "$candidate" ]; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    done < <(find "$HOME/.nvm/versions/node" -maxdepth 3 -path '*/bin/codex' -type f 2>/dev/null | sort -V -r)
+  fi
+
   for candidate in \
-    "$HOME/.nvm/versions/node/current/bin/codex" \
     "$HOME/.local/bin/codex" \
     "$HOME/.local/share/pnpm/codex" \
     /usr/local/bin/codex \
@@ -393,6 +495,14 @@ resolve_codex_cli() {
   done
 
   return 1
+}
+
+notify_launch_failure() {
+  local message="$1"
+
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send -u critical "Codex Desktop" "$message"
+  fi
 }
 
 clear_stale_webview_pid() {
@@ -436,12 +546,18 @@ start_webview_server() {
 
 main() {
   local codex_cli_path=""
+  local launch_error=""
 
   codex_cli_path="$(resolve_codex_cli || true)"
   if [ -z "$codex_cli_path" ]; then
-    echo "Codex CLI not found. Install it first, for example with: npm i -g @openai/codex" >&2
+    launch_error="Codex CLI not found. Install it first, for example with: npm i -g @openai/codex"
+    notify_launch_failure "$launch_error"
+    echo "$launch_error" >&2
     exit 1
   fi
+
+  exec >>"$LAUNCHER_LOG_FILE" 2>&1
+  echo "Launching Codex Desktop (codex=$codex_cli_path)"
 
   export CODEX_CLI_PATH="$codex_cli_path"
   export ELECTRON_FORCE_IS_PACKAGED=1
@@ -467,18 +583,47 @@ EOF
   chmod +x "$INSTALL_DIR/start.sh"
 }
 
+trust_desktop_entry() {
+  local desktop_file="$1"
+
+  command -v gio >/dev/null 2>&1 || return 0
+
+  if gio set "$desktop_file" metadata::trusted true 2>/dev/null; then
+    return 0
+  fi
+
+  if command -v dbus-launch >/dev/null 2>&1; then
+    dbus-launch gio set "$desktop_file" metadata::trusted true 2>/dev/null && return 0
+  fi
+
+  warn "Could not mark desktop entry as trusted; double-click may require 'Allow Launching' in the file manager."
+}
+
 install_desktop_entry() {
   local exec_path="$INSTALL_DIR/start.sh"
   local icon_path="$INSTALL_DIR/codex.png"
   local temp_file="$WORK_DIR/codex-desktop.desktop"
+  local desktop_dir=""
+  local codex_cli_path=""
+  local desktop_exec=""
+
+  resolve_desktop_file_path
 
   [ -x "$exec_path" ] || error "Launcher not found: $exec_path"
   [ -f "$DESKTOP_TEMPLATE" ] || error "Desktop template not found: $DESKTOP_TEMPLATE"
 
-  mkdir -p "$(dirname "$DESKTOP_FILE_PATH")"
+  codex_cli_path="$(detect_codex_cli || true)"
+  if [ -n "$codex_cli_path" ]; then
+    desktop_exec="env CODEX_CLI_PATH=$codex_cli_path $exec_path"
+    info "Desktop Exec will pin CODEX_CLI_PATH=$codex_cli_path"
+  else
+    desktop_exec="$exec_path"
+    warn "Codex CLI not found in PATH; double-click may fail until you run: npm i -g @openai/codex"
+  fi
 
   sed \
-    -e "s|__EXEC__|$exec_path|g" \
+    -e "s|__EXEC__|$desktop_exec|g" \
+    -e "s|__TRYEXEC__|$exec_path|g" \
     -e "s|__ICON__|$icon_path|g" \
     "$DESKTOP_TEMPLATE" > "$temp_file"
 
@@ -486,8 +631,29 @@ install_desktop_entry() {
     desktop-file-validate "$temp_file"
   fi
 
-  cp "$temp_file" "$DESKTOP_FILE_PATH"
-  info "Desktop entry installed: $DESKTOP_FILE_PATH"
+  desktop_dir="$(dirname "$DESKTOP_FILE_PATH")"
+
+  if desktop_entry_needs_root; then
+    command -v sudo >/dev/null 2>&1 || error "Installing $DESKTOP_FILE_PATH requires sudo"
+    info "Installing system desktop entry (mode 755): $DESKTOP_FILE_PATH"
+    sudo install -D -m 755 "$temp_file" "$DESKTOP_FILE_PATH"
+    if command -v update-desktop-database >/dev/null 2>&1; then
+      sudo update-desktop-database "$desktop_dir" >/dev/null 2>&1 || true
+    fi
+    if [ -f "$USER_DESKTOP_FILE_PATH" ]; then
+      warn "Old user desktop entry still present: $USER_DESKTOP_FILE_PATH (remove it to avoid duplicates)"
+    fi
+  else
+    mkdir -p "$desktop_dir"
+    cp "$temp_file" "$DESKTOP_FILE_PATH"
+    chmod 755 "$DESKTOP_FILE_PATH"
+    trust_desktop_entry "$DESKTOP_FILE_PATH"
+    if command -v update-desktop-database >/dev/null 2>&1; then
+      update-desktop-database "$desktop_dir" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  info "Desktop entry installed: $DESKTOP_FILE_PATH ($(stat -c '%a' "$DESKTOP_FILE_PATH"))"
 }
 
 main() {
@@ -519,6 +685,9 @@ Runtime dir:   $INSTALL_DIR
 
 You can start it with:
   $INSTALL_DIR/start.sh
+  gtk-launch codex-desktop
+
+Launch from the app menu, or: gtk-launch codex-desktop
 EOF
 }
 
