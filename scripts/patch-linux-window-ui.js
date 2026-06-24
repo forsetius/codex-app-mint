@@ -56,6 +56,14 @@ if (source.includes(setIconNeedle) && !source.includes("&&D.setIcon(")) {
   source = source.replace(setIconNeedle, setIconPatch);
 }
 
+const opaqueSurfaceNeedle =
+  "shouldAlwaysUseOpaqueWindowSurface(e){return m5({appearance:e,opaqueWindowsEnabled:this.isOpaqueWindowsEnabled(),platform:process.platform})||!uP()&&!f5(e)}";
+const opaqueSurfacePatch =
+  "shouldAlwaysUseOpaqueWindowSurface(e){return process.platform===`linux`&&!f5(e)||m5({appearance:e,opaqueWindowsEnabled:this.isOpaqueWindowsEnabled(),platform:process.platform})||!uP()&&!f5(e)}";
+if (source.includes(opaqueSurfaceNeedle) && !source.includes("process.platform===`linux`&&!f5(e)||m5(")) {
+  source = source.replace(opaqueSurfaceNeedle, opaqueSurfacePatch);
+}
+
 const colorConstRegex = /([A-Za-z_$][\w$]*)=`#00000000`,([A-Za-z_$][\w$]*)=`#000000`,([A-Za-z_$][\w$]*)=`#f9f9f9`/;
 const colorMatch = source.match(colorConstRegex);
 if (colorMatch) {

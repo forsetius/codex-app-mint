@@ -5,17 +5,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$SCRIPT_DIR"
 PATCH_SCRIPT="$PROJECT_DIR/scripts/patch-linux-window-ui.js"
 NATIVE_MODULE_PATCH_SCRIPT="$PROJECT_DIR/scripts/patch-native-module-loaders.js"
+OWL_FEATURES_PATCH_SCRIPT="$PROJECT_DIR/scripts/patch-owl-features-fallback.js"
 DESKTOP_TEMPLATE="$PROJECT_DIR/templates/codex-desktop.desktop.in"
 
 OUTPUT_ROOT="${CODEX_PORT_OUTPUT_ROOT:-$PROJECT_DIR/runtime}"
 INSTALL_DIR="${CODEX_PORT_INSTALL_DIR:-$OUTPUT_ROOT/codex-app}"
 CACHE_DIR="${CODEX_PORT_CACHE_DIR:-$OUTPUT_ROOT/cache}"
+BUILD_LOG_DIR="$OUTPUT_ROOT/logs"
 WORK_DIR="$(mktemp -d)"
 
 DEFAULT_DMG_PATH="$CACHE_DIR/Codex.dmg"
 DMG_PATH=""
 DMG_URL="${CODEX_DMG_URL:-https://persistent.oaistatic.com/codex-app-prod/Codex.dmg}"
-ELECTRON_VERSION="${CODEX_ELECTRON_VERSION:-40.0.0}"
+ELECTRON_VERSION="${CODEX_ELECTRON_VERSION:-}"
+DEFAULT_ELECTRON_VERSION="40.0.0"
 DESKTOP_FILE_PATH="${CODEX_DESKTOP_FILE_PATH:-$HOME/.local/share/applications/codex-desktop.desktop}"
 
 FRESH_INSTALL=0
@@ -40,6 +43,27 @@ error() {
   exit 1
 }
 
+run_logged_command() {
+  local label="$1"
+  local log_path="$2"
+  local status=0
+  shift 2
+
+  mkdir -p "$(dirname "$log_path")"
+
+  if "$@" >"$log_path" 2>&1; then
+    return 0
+  else
+    status=$?
+  fi
+
+  warn "$label failed with exit code $status"
+  warn "Full log: $log_path"
+  warn "Last 80 log lines:"
+  tail -n 80 "$log_path" >&2 || true
+  return "$status"
+}
+
 cleanup() {
   rm -rf "$WORK_DIR"
 }
@@ -61,7 +85,8 @@ Options:
   -h, --help                 Show this help and exit.
 
 Environment variables:
-  CODEX_ELECTRON_VERSION     Override the Electron runtime version (default: 40.0.0).
+  CODEX_ELECTRON_VERSION     Override the Electron runtime version (default: detected from the app bundle, fallback: 40.0.0).
+  CODEX_BETTER_SQLITE3_VERSION Override the better-sqlite3 version used for the Linux native rebuild.
   CODEX_DMG_URL              Override the upstream DMG URL.
   CODEX_PORT_OUTPUT_ROOT     Override the runtime output root (default: ./runtime).
   CODEX_PORT_INSTALL_DIR     Override the app install directory (default: ./runtime/codex-app).
@@ -109,7 +134,7 @@ parse_args() {
 }
 
 prepare_dirs() {
-  mkdir -p "$OUTPUT_ROOT" "$CACHE_DIR"
+  mkdir -p "$OUTPUT_ROOT" "$CACHE_DIR" "$BUILD_LOG_DIR"
 
   if [ "$FRESH_INSTALL" -eq 1 ]; then
     info "Removing previous runtime directory: $INSTALL_DIR"
@@ -198,10 +223,73 @@ extract_dmg() {
   printf '%s\n' "$app_dir"
 }
 
+detect_electron_version() {
+  local extracted_asar_dir="$1"
+  local detected_electron_version=""
+
+  if [ -n "${CODEX_ELECTRON_VERSION:-}" ]; then
+    ELECTRON_VERSION="$CODEX_ELECTRON_VERSION"
+    info "Using Electron override: $ELECTRON_VERSION"
+    return
+  fi
+
+  detected_electron_version="$(node -p "
+const packageJson = require('$extracted_asar_dir/package.json');
+const candidates = [
+  packageJson.devDependencies && packageJson.devDependencies.electron,
+  packageJson.dependencies && packageJson.dependencies.electron,
+  packageJson.electronVersion,
+  packageJson.build && packageJson.build.electronVersion,
+];
+const version = candidates.find((candidate) => typeof candidate === 'string' && candidate.length > 0);
+version ? version.replace(/^[^0-9]*/, '') : '';
+" 2>/dev/null || true)"
+
+  if [ -n "$detected_electron_version" ]; then
+    ELECTRON_VERSION="$detected_electron_version"
+    info "Detected Electron version from app bundle: $ELECTRON_VERSION"
+    return
+  fi
+
+  ELECTRON_VERSION="$DEFAULT_ELECTRON_VERSION"
+  warn "Could not detect Electron version from app bundle; falling back to $ELECTRON_VERSION"
+}
+
+version_less_than() {
+  local current_version="$1"
+  local minimum_version="$2"
+
+  [ "$current_version" != "$minimum_version" ] &&
+    [ "$(printf '%s\n%s\n' "$current_version" "$minimum_version" | sort -V | head -n 1)" = "$current_version" ]
+}
+
+resolve_better_sqlite3_build_version() {
+  local detected_version="$1"
+  local electron_version="$2"
+  local electron_major="${electron_version%%.*}"
+  local detected_major="${detected_version%%.*}"
+  local electron_42_minimum_version="12.11.1"
+
+  if [ -n "${CODEX_BETTER_SQLITE3_VERSION:-}" ]; then
+    printf '%s\n' "$CODEX_BETTER_SQLITE3_VERSION"
+    return
+  fi
+
+  if [ "$electron_major" -ge 42 ] &&
+    [ "$detected_major" = "12" ] &&
+    version_less_than "$detected_version" "$electron_42_minimum_version"; then
+    printf '%s\n' "$electron_42_minimum_version"
+    return
+  fi
+
+  printf '%s\n' "$detected_version"
+}
+
 build_native_modules() {
   local extracted_asar_dir="$1"
   local native_build_dir="$WORK_DIR/native-build"
   local better_sqlite3_version=""
+  local better_sqlite3_build_version=""
   local node_pty_version=""
   local better_sqlite3_binary=""
   local node_pty_binary=""
@@ -212,9 +300,13 @@ build_native_modules() {
 
   [ -n "$better_sqlite3_version" ] || error "Could not detect better-sqlite3 version in the app bundle"
   [ -n "$node_pty_version" ] || error "Could not detect node-pty version in the app bundle"
+  better_sqlite3_build_version="$(resolve_better_sqlite3_build_version "$better_sqlite3_version" "$ELECTRON_VERSION")"
 
   info "Rebuilding native modules for Linux"
-  info "better-sqlite3@$better_sqlite3_version, node-pty@$node_pty_version, electron@$ELECTRON_VERSION"
+  if [ "$better_sqlite3_build_version" != "$better_sqlite3_version" ]; then
+    warn "Using better-sqlite3@$better_sqlite3_build_version for Electron $ELECTRON_VERSION; app bundle contains $better_sqlite3_version"
+  fi
+  info "better-sqlite3@$better_sqlite3_build_version, node-pty@$node_pty_version, electron@$ELECTRON_VERSION"
 
   mkdir -p "$native_build_dir"
   cd "$native_build_dir"
@@ -226,15 +318,21 @@ build_native_modules() {
   "private": true,
   "dependencies": {
     "electron": "$ELECTRON_VERSION",
-    "better-sqlite3": "$better_sqlite3_version",
+    "better-sqlite3": "$better_sqlite3_build_version",
     "node-pty": "$node_pty_version"
   }
 }
 EOF
 
-  npm install --ignore-scripts --no-audit --no-fund >&2
+  run_logged_command \
+    "npm install for native module rebuild" \
+    "$BUILD_LOG_DIR/native-npm-install.log" \
+    npm install --ignore-scripts --no-audit --no-fund
 
-  npx --yes @electron/rebuild -v "$ELECTRON_VERSION" --force >&2
+  run_logged_command \
+    "electron-rebuild for native modules" \
+    "$BUILD_LOG_DIR/electron-rebuild.log" \
+    npx --yes @electron/rebuild -v "$ELECTRON_VERSION" --force
 
   better_sqlite3_binary="$(find "$native_build_dir/node_modules/better-sqlite3" -type f -name 'better_sqlite3.node' | head -n 1 || true)"
   node_pty_binary="$(find "$native_build_dir/node_modules/node-pty" -type f -name 'pty.node' | grep '/build/' | head -n 1 || true)"
@@ -265,6 +363,8 @@ patch_asar() {
     cp -R "$resources_dir/app.asar.unpacked/." "$extracted_asar_dir/"
   fi
 
+  detect_electron_version "$extracted_asar_dir"
+
   rm -rf "$extracted_asar_dir/node_modules/sparkle-darwin" 2>/dev/null || true
   find "$extracted_asar_dir" -name 'sparkle.node' -delete 2>/dev/null || true
 
@@ -273,6 +373,11 @@ patch_asar() {
   if [ -f "$NATIVE_MODULE_PATCH_SCRIPT" ]; then
     info "Patching native module loaders for Linux/Electron"
     node "$NATIVE_MODULE_PATCH_SCRIPT" "$extracted_asar_dir" >&2
+  fi
+
+  if [ -f "$OWL_FEATURES_PATCH_SCRIPT" ]; then
+    info "Patching OWL feature bindings fallback"
+    node "$OWL_FEATURES_PATCH_SCRIPT" "$extracted_asar_dir" >&2
   fi
 
   if [ -f "$PATCH_SCRIPT" ]; then
@@ -456,7 +561,6 @@ main() {
     --app-id=codex-desktop \
     --ozone-platform-hint=auto \
     --disable-gpu-sandbox \
-    --disable-gpu-compositing \
     --enable-features=WaylandWindowDecorations \
     "$@"
 }
