@@ -28,6 +28,37 @@ exit 42
 EOF
 chmod +x "$TEMP_DIR/install/electron"
 
+mkdir -p "$TEMP_DIR/bin"
+cat > "$TEMP_DIR/bin/notify-send" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$CODEX_TEST_NOTIFICATION_LOG"
+EOF
+chmod +x "$TEMP_DIR/bin/notify-send"
+
+mkdir -p "$TEMP_DIR/home-without-cli"
+set +e
+env -u CODEX_CLI_PATH \
+  HOME="$TEMP_DIR/home-without-cli" \
+  PATH="$TEMP_DIR/bin:/usr/bin:/bin" \
+  CODEX_LAUNCHER_STDERR=1 \
+  CODEX_TEST_NOTIFICATION_LOG="$TEMP_DIR/notifications.txt" \
+  XDG_CACHE_HOME="$TEMP_DIR/cache-missing-cli" \
+  XDG_CONFIG_HOME="$TEMP_DIR/config-missing-cli" \
+  XDG_STATE_HOME="$TEMP_DIR/state-missing-cli" \
+  "$TEMP_DIR/install/start.sh" > "$TEMP_DIR/missing-cli-stdout.txt" 2> "$TEMP_DIR/missing-cli-stderr.txt"
+missing_cli_status=$?
+set -e
+
+if [ "$missing_cli_status" -eq 0 ]; then
+  printf 'FAIL: launcher accepted a missing Codex CLI\n' >&2
+  exit 1
+fi
+
+if ! grep -q 'Codex CLI not found' "$TEMP_DIR/notifications.txt"; then
+  printf 'FAIL: launcher did not notify about the missing Codex CLI\n' >&2
+  exit 1
+fi
+
 if ! grep -q 'exec python3 -m http.server' "$TEMP_DIR/install/start.sh"; then
   printf 'FAIL: webview server subshell must exec Python so cleanup targets the server process\n' >&2
   exit 1
@@ -42,6 +73,8 @@ ln -s "$(hostname)-$$" "$TEMP_DIR/config/Codex/SingletonLock"
 set +e
 CODEX_CLI_PATH=/bin/true \
 CODEX_LAUNCHER_STDERR=1 \
+CODEX_TEST_NOTIFICATION_LOG="$TEMP_DIR/notifications.txt" \
+PATH="$TEMP_DIR/bin:$PATH" \
 XDG_CACHE_HOME="$TEMP_DIR/cache" \
 XDG_CONFIG_HOME="$TEMP_DIR/config" \
 XDG_STATE_HOME="$TEMP_DIR/state" \
@@ -59,11 +92,18 @@ if ! grep -q 'different Codex Desktop installation is already running' "$TEMP_DI
   exit 1
 fi
 
+if ! grep -q 'different Codex Desktop installation is already running' "$TEMP_DIR/notifications.txt"; then
+  printf 'FAIL: launcher did not notify about the conflicting installation\n' >&2
+  exit 1
+fi
+
 set +e
 CODEX_CLI_PATH=/bin/true \
 CODEX_ELECTRON_USER_DATA_PATH="$TEMP_DIR/profile" \
 CODEX_LAUNCHER_LOG_MAX_BYTES=1 \
 CODEX_LAUNCHER_STDERR=1 \
+CODEX_TEST_NOTIFICATION_LOG="$TEMP_DIR/notifications.txt" \
+PATH="$TEMP_DIR/bin:$PATH" \
 XDG_CACHE_HOME="$TEMP_DIR/cache" \
 XDG_STATE_HOME="$TEMP_DIR/state" \
   "$TEMP_DIR/install/start.sh" > "$TEMP_DIR/stdout.txt" 2> "$TEMP_DIR/stderr.txt"
@@ -82,6 +122,11 @@ fi
 
 if ! grep -q "$TEMP_DIR/cache/codex-app-linux/launcher.log" "$TEMP_DIR/stderr.txt"; then
   printf 'FAIL: launcher did not report its log path\n' >&2
+  exit 1
+fi
+
+if ! grep -q 'Codex Desktop failed to start (exit code 42)' "$TEMP_DIR/notifications.txt"; then
+  printf 'FAIL: launcher did not notify about the Electron startup failure\n' >&2
   exit 1
 fi
 

@@ -560,6 +560,10 @@ exec >>"$LAUNCHER_LOG_FILE" 2>&1
 
 resolve_codex_cli() {
   local candidate=""
+  local nvm_default_alias=""
+  local nvm_default_version_prefix=""
+  local installed_node_version=""
+  local nvm_versions_directory="$HOME/.nvm/versions/node"
 
   if [ -n "${CODEX_CLI_PATH:-}" ] && [ -x "${CODEX_CLI_PATH}" ]; then
     printf '%s\n' "$CODEX_CLI_PATH"
@@ -571,8 +575,76 @@ resolve_codex_cli() {
     return 0
   fi
 
+  if [ -r "$HOME/.nvm/alias/default" ]; then
+    nvm_default_alias="$(tr -d '[:space:]' < "$HOME/.nvm/alias/default")"
+    case "$nvm_default_alias" in
+      ''|*/*)
+        ;;
+      *)
+        candidate="$nvm_versions_directory/$nvm_default_alias/bin/codex"
+        if [ -x "$candidate" ]; then
+          printf '%s\n' "$candidate"
+          return 0
+        fi
+
+        case "$nvm_default_alias" in
+          v*) ;;
+          *)
+            candidate="$nvm_versions_directory/v$nvm_default_alias/bin/codex"
+            if [ -x "$candidate" ]; then
+              printf '%s\n' "$candidate"
+              return 0
+            fi
+            ;;
+        esac
+        ;;
+    esac
+
+    nvm_default_version_prefix="${nvm_default_alias#v}"
+    case "$nvm_default_version_prefix" in
+      ''|*[!0-9.]*)
+        ;;
+      *)
+        while IFS= read -r candidate; do
+          installed_node_version="$(basename "$(dirname "$(dirname "$candidate")")")"
+          installed_node_version="${installed_node_version#v}"
+          case "$installed_node_version" in
+            "$nvm_default_version_prefix"|"$nvm_default_version_prefix".*)
+              if [ -x "$candidate" ]; then
+                printf '%s\n' "$candidate"
+                return 0
+              fi
+              ;;
+          esac
+        done < <(
+          find "$nvm_versions_directory" \
+            -mindepth 3 \
+            -maxdepth 3 \
+            -path '*/bin/codex' \
+            \( -type f -o -type l \) \
+            -print 2>/dev/null | sort -V -r
+        )
+        ;;
+    esac
+  fi
+
+  if [ -d "$nvm_versions_directory" ]; then
+    while IFS= read -r candidate; do
+      if [ -x "$candidate" ]; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    done < <(
+      find "$nvm_versions_directory" \
+        -mindepth 3 \
+        -maxdepth 3 \
+        -path '*/bin/codex' \
+        \( -type f -o -type l \) \
+        -print 2>/dev/null | sort -V -r
+    )
+  fi
+
   for candidate in \
-    "$HOME/.nvm/versions/node/current/bin/codex" \
     "$HOME/.local/bin/codex" \
     "$HOME/.local/share/pnpm/codex" \
     /usr/local/bin/codex \
@@ -585,6 +657,14 @@ resolve_codex_cli() {
   done
 
   return 1
+}
+
+notify_launch_failure() {
+  local message="$1"
+
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send -u critical "Codex Desktop" "$message" >/dev/null 2>&1 || true
+  fi
 }
 
 check_for_conflicting_installation() {
@@ -625,6 +705,7 @@ check_for_conflicting_installation() {
   error_message="A different Codex Desktop installation is already running (PID $running_pid). Close it before starting this build. Running executable: $running_executable_path"
   echo "$error_message" >&2
   echo "$error_message" >&3
+  notify_launch_failure "$error_message"
   return 1
 }
 
@@ -641,6 +722,8 @@ clear_stale_webview_pid() {
 }
 
 start_webview_server() {
+  local error_message=""
+
   if [ ! -d "$WEBVIEW_DIR" ]; then
     return 0
   fi
@@ -663,17 +746,24 @@ start_webview_server() {
     sleep 0.1
   done
 
-  echo "Failed to start the local webview server on port 5175" >&2
+  error_message="Failed to start the local Codex Desktop webview server on port 5175."
+  echo "$error_message" >&2
+  echo "$error_message" >&3
+  notify_launch_failure "$error_message"
   return 1
 }
 
 main() {
   local codex_cli_path=""
   local electron_status=0
+  local launch_error=""
 
   codex_cli_path="$(resolve_codex_cli || true)"
   if [ -z "$codex_cli_path" ]; then
-    echo "Codex CLI not found. Install it first, for example with: npm i -g @openai/codex" >&2
+    launch_error="Codex CLI not found. Install it first, for example with: npm i -g @openai/codex"
+    echo "$launch_error" >&2
+    echo "$launch_error" >&3
+    notify_launch_failure "$launch_error"
     exit 1
   fi
 
@@ -698,7 +788,9 @@ main() {
     electron_status=$?
   fi
 
-  echo "Codex Desktop failed to start (exit code $electron_status)." >&3
+  launch_error="Codex Desktop failed to start (exit code $electron_status). See $LAUNCHER_LOG_FILE for details."
+  notify_launch_failure "$launch_error"
+  echo "$launch_error" >&3
   echo "Launcher log: $LAUNCHER_LOG_FILE" >&3
   tail -n 40 "$LAUNCHER_LOG_FILE" >&3 || true
   return "$electron_status"
@@ -722,6 +814,7 @@ install_desktop_entry() {
 
   sed \
     -e "s|__EXEC__|$exec_path|g" \
+    -e "s|__TRYEXEC__|$exec_path|g" \
     -e "s|__ICON__|$icon_path|g" \
     "$DESKTOP_TEMPLATE" > "$temp_file"
 
