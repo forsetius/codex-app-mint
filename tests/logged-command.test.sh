@@ -10,14 +10,10 @@ cleanup() {
 
 trap cleanup EXIT
 
-source_script_without_main() {
-  sed '$d' "$REPO_DIR/port-codex-app-mint.sh"
-}
-
 set +e
 (
   set +e
-  source <(source_script_without_main)
+  source "$REPO_DIR/port-codex-app-mint.sh"
   trap - ERR
   run_logged_command "failing test command" "$TEMP_DIR/failing-command.log" bash -c 'printf "first line\n"; printf "last diagnostic\n"; exit 42'
 ) >"$TEMP_DIR/stdout.txt" 2>"$TEMP_DIR/stderr.txt"

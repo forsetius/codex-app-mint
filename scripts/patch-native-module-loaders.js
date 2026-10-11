@@ -26,10 +26,9 @@ const nodePtyUtilsFile = path.join(
   "utils.js",
 );
 
-function replaceOnce(source, searchValue, replaceValue, filePath, label) {
+function replaceRequired(source, searchValue, replaceValue, filePath, label) {
   if (!source.includes(searchValue)) {
-    console.warn(`WARN: Could not find ${label} in ${filePath}`);
-    return source;
+    throw new Error(`Could not find ${label} in ${filePath}`);
   }
 
   return source.replace(searchValue, replaceValue);
@@ -37,16 +36,15 @@ function replaceOnce(source, searchValue, replaceValue, filePath, label) {
 
 function patchBetterSqlite3(filePath) {
   if (!fs.existsSync(filePath)) {
-    console.warn(`WARN: better-sqlite3 file not found: ${filePath}`);
-    return;
+    throw new Error(`better-sqlite3 file not found: ${filePath}`);
   }
 
   let source = fs.readFileSync(filePath, "utf8");
   if (source.includes("resolveUnpackedNativePath")) {
-    return;
+    return null;
   }
 
-  source = replaceOnce(
+  source = replaceRequired(
     source,
     "let DEFAULT_ADDON;\n",
     `let DEFAULT_ADDON;\n` +
@@ -57,35 +55,34 @@ function patchBetterSqlite3(filePath) {
     "better-sqlite3 helper insertion point",
   );
 
-  source = replaceOnce(
+  source = replaceRequired(
     source,
     "addon = DEFAULT_ADDON || (DEFAULT_ADDON = require('bindings')('better_sqlite3.node'));",
     `const requireFunc = typeof __non_webpack_require__ === 'function' ? __non_webpack_require__ : require;\n` +
       `\t\tconst nativeModulePath = resolveUnpackedNativePath(path.join(__dirname, '..', 'build', 'Release', 'better_sqlite3.node'));\n` +
       `\t\ttry {\n` +
       `\t\t\taddon = DEFAULT_ADDON || (DEFAULT_ADDON = requireFunc(nativeModulePath));\n` +
-      `\t\t} catch (directRequireError) {\n` +
+      `\t\t} catch {\n` +
       `\t\t\taddon = DEFAULT_ADDON || (DEFAULT_ADDON = require('bindings')('better_sqlite3.node'));\n` +
       `\t\t}`,
     filePath,
     "better-sqlite3 native binding loader",
   );
 
-  fs.writeFileSync(filePath, source, "utf8");
+  return source;
 }
 
 function patchNodePty(filePath) {
   if (!fs.existsSync(filePath)) {
-    console.warn(`WARN: node-pty file not found: ${filePath}`);
-    return;
+    throw new Error(`node-pty file not found: ${filePath}`);
   }
 
   let source = fs.readFileSync(filePath, "utf8");
   if (source.includes("resolveUnpackedNativePath")) {
-    return;
+    return null;
   }
 
-  source = replaceOnce(
+  source = replaceRequired(
     source,
     "Object.defineProperty(exports, \"__esModule\", { value: true });\nexports.loadNativeModule = exports.assign = void 0;\n",
     "Object.defineProperty(exports, \"__esModule\", { value: true });\nexports.loadNativeModule = exports.assign = void 0;\nvar path = require(\"path\");\nvar resolveUnpackedNativePath = function (inputPath) {\n    return inputPath.includes(\"/app.asar/\") ? inputPath.replace(\"/app.asar/\", \"/app.asar.unpacked/\") : inputPath;\n};\n",
@@ -93,7 +90,7 @@ function patchNodePty(filePath) {
     "node-pty helper insertion point",
   );
 
-  source = replaceOnce(
+  source = replaceRequired(
     source,
     "                return { dir: dir, module: require(dir + \"/\" + name + \".node\") };",
     "                var nativeModulePath = resolveUnpackedNativePath(path.join(__dirname, dir, name + \".node\"));\n                return { dir: dir, module: require(nativeModulePath) };",
@@ -101,11 +98,18 @@ function patchNodePty(filePath) {
     "node-pty native loader",
   );
 
-  fs.writeFileSync(filePath, source, "utf8");
+  return source;
 }
 
-patchBetterSqlite3(betterSqlite3File);
-patchNodePty(nodePtyUtilsFile);
+const patchedBetterSqlite3Source = patchBetterSqlite3(betterSqlite3File);
+const patchedNodePtySource = patchNodePty(nodePtyUtilsFile);
+
+if (patchedBetterSqlite3Source != null) {
+  fs.writeFileSync(betterSqlite3File, patchedBetterSqlite3Source, "utf8");
+}
+if (patchedNodePtySource != null) {
+  fs.writeFileSync(nodePtyUtilsFile, patchedNodePtySource, "utf8");
+}
 
 console.log("Patched native module loaders:", {
   betterSqlite3File,

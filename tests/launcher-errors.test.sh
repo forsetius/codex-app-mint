@@ -10,12 +10,8 @@ cleanup() {
 
 trap cleanup EXIT
 
-source_script_without_main() {
-  sed '$d' "$REPO_DIR/port-codex-app-mint.sh"
-}
-
 (
-  source <(source_script_without_main)
+  source "$REPO_DIR/port-codex-app-mint.sh"
   INSTALL_DIR="$TEMP_DIR/install"
   mkdir -p "$INSTALL_DIR"
   create_launcher
@@ -137,6 +133,11 @@ fi
 
 if [ "$(wc -c < "$TEMP_DIR/cache/codex-app-linux/launcher.log.1")" -gt 1 ]; then
   printf 'FAIL: launcher did not bound the rotated log size\n' >&2
+  exit 1
+fi
+
+if [ "$(wc -c < "$TEMP_DIR/cache/codex-app-linux/launcher.log")" -gt 1 ]; then
+  printf 'FAIL: launcher did not bound the current log size after exit\n' >&2
   exit 1
 fi
 

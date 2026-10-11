@@ -78,9 +78,34 @@ function patchBootstrapFailureLogging(javaScriptFiles) {
   }
 }
 
+function patchOptionalDownloadHistory(javaScriptFiles) {
+  for (const filePath of javaScriptFiles) {
+    let source = fs.readFileSync(filePath, "utf8");
+    const originalSource = source;
+
+    source = source.replaceAll(
+      ".getDownloadHistory().catch(()=>null)",
+      ".getDownloadHistory?.().catch(()=>null)??Promise.resolve(null)",
+    );
+    source = source.replace(
+      /async readNativeHistory\(\)\{return this\.browserSession==null\?null:\(await this\.browserSession\.getDownloadHistory\(\)\)\.filter\(([A-Za-z_$][\w$]*)\)\}/g,
+      (_match, filterFunctionName) =>
+        `async readNativeHistory(){return this.browserSession==null||typeof this.browserSession.getDownloadHistory!==\`function\`?null:(await this.browserSession.getDownloadHistory()).filter(${filterFunctionName})}`,
+    );
+    source = source.replace(
+      /this\.browserSession==null\?null:\(await this\.browserSession\.searchDownloadHistory\(([A-Za-z_$][\w$]*)\)\)\.filter\(([A-Za-z_$][\w$]*)\)/g,
+      (_match, searchArgumentsName, filterFunctionName) =>
+        `this.browserSession==null||typeof this.browserSession.searchDownloadHistory!==\`function\`?null:(await this.browserSession.searchDownloadHistory(${searchArgumentsName})).filter(${filterFunctionName})`,
+    );
+
+    if (source !== originalSource) {
+      fs.writeFileSync(filePath, source, "utf8");
+    }
+  }
+}
+
 if (!fs.existsSync(buildDir) || !fs.existsSync(bootstrapPath)) {
-  console.warn("WARN: Required bootstrap file for OWL patching was not found. Skipping.");
-  process.exit(0);
+  throw new Error("Required bootstrap file for OWL patching was not found");
 }
 
 const javaScriptFiles = readJavaScriptFiles(buildDir);
@@ -99,6 +124,8 @@ if (!usesOwlFeatures && !requiresOwlAppShell) {
   console.log("No OWL compatibility requirements found. Skipping.");
   process.exit(0);
 }
+
+patchOptionalDownloadHistory(javaScriptFiles);
 
 let source = fs.readFileSync(bootstrapPath, "utf8");
 
@@ -123,6 +150,8 @@ const fallbackSource = `(() => {
       }
     };
     const noOperation = () => {};
+    const emptyAsyncResult = async () => [];
+    const falseAsyncResult = async () => false;
     const unsupportedFeature = () => false;
 
     for (const methodName of [
@@ -140,7 +169,25 @@ const fallbackSource = `(() => {
     defineMissingMethod(electron.BrowserWindow, "isSystemBackdropSupported", unsupportedFeature);
 
     const enhanceSession = (session) => {
+      if (session == null) {
+        return session;
+      }
+
       defineMissingMethod(session, "setPreferredLanguages", noOperation);
+      defineMissingMethod(session, "searchHistory", emptyAsyncResult);
+      defineMissingMethod(session, "removeBrowsingHistoryEntries", falseAsyncResult);
+      defineMissingMethod(session, "getBrowsingDataSettings", async () => ({
+        dataRemovalPermitted: {
+          downloads: false,
+          history: false,
+        },
+      }));
+      if (session.faviconService == null) {
+        session.faviconService = {
+          getFaviconForIconURL: async () => null,
+          getFaviconForPageURL: async () => null,
+        };
+      }
       return session;
     };
     if (typeof electron.session?.fromPartition === "function") {

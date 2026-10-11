@@ -10,12 +10,8 @@ cleanup() {
 
 trap cleanup EXIT
 
-source_script_without_main() {
-  sed '$d' "$REPO_DIR/port-codex-app-mint.sh"
-}
-
 (
-  source <(source_script_without_main)
+  source "$REPO_DIR/port-codex-app-mint.sh"
   INSTALL_DIR="$TEMP_DIR/install"
   mkdir -p "$INSTALL_DIR"
   create_launcher

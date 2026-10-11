@@ -49,6 +49,25 @@ try {
     "Linux primary windows should use an opaque background surface",
   );
 
+  const unsupportedDirectory = path.join(tempDir, "unsupported");
+  const unsupportedAssetsDirectory = path.join(unsupportedDirectory, "webview", "assets");
+  const unsupportedBuildDirectory = path.join(unsupportedDirectory, ".vite", "build");
+  fs.mkdirSync(unsupportedAssetsDirectory, { recursive: true });
+  fs.mkdirSync(unsupportedBuildDirectory, { recursive: true });
+  fs.writeFileSync(path.join(unsupportedAssetsDirectory, "app-test.png"), "fake png", "utf8");
+  fs.writeFileSync(path.join(unsupportedBuildDirectory, "main-test.js"), "unrecognized();\n", "utf8");
+
+  const unsupportedResult = spawnSync(
+    process.execPath,
+    [path.join(repoDir, "scripts", "patch-linux-window-ui.js"), unsupportedDirectory],
+    { encoding: "utf8" },
+  );
+  assert.notStrictEqual(
+    unsupportedResult.status,
+    0,
+    "patcher should fail when upstream contains no recognized Linux patch points",
+  );
+
   console.log("linux-window-ui-patch tests passed");
 } finally {
   fs.rmSync(tempDir, { recursive: true, force: true });

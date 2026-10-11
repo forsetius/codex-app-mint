@@ -7,6 +7,7 @@ PATCH_SCRIPT="$PROJECT_DIR/scripts/patch-linux-window-ui.js"
 NATIVE_MODULE_PATCH_SCRIPT="$PROJECT_DIR/scripts/patch-native-module-loaders.js"
 OWL_FEATURES_PATCH_SCRIPT="$PROJECT_DIR/scripts/patch-owl-features-fallback.js"
 NATIVE_MODULE_COPY_SCRIPT="$PROJECT_DIR/scripts/copy-node-module-closure.js"
+DESKTOP_ENTRY_RENDER_SCRIPT="$PROJECT_DIR/scripts/render-desktop-entry.js"
 DESKTOP_TEMPLATE="$PROJECT_DIR/templates/codex-desktop.desktop.in"
 
 OUTPUT_ROOT="${CODEX_PORT_OUTPUT_ROOT:-$PROJECT_DIR/runtime}"
@@ -20,6 +21,9 @@ DMG_PATH=""
 DMG_URL="${CODEX_DMG_URL:-https://persistent.oaistatic.com/codex-app-prod/Codex.dmg}"
 ELECTRON_VERSION="${CODEX_ELECTRON_VERSION:-}"
 DEFAULT_ELECTRON_VERSION="40.0.0"
+ELECTRON_REBUILD_PACKAGE="@electron/rebuild@4.2.1"
+ASAR_CLI_PACKAGE="@electron/asar@4.3.1"
+MINIMUM_NODE_VERSION="22.12.0"
 DESKTOP_FILE_PATH="${CODEX_DESKTOP_FILE_PATH:-$HOME/.local/share/applications/codex-desktop.desktop}"
 
 FRESH_INSTALL=0
@@ -32,15 +36,15 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 info() {
-  echo -e "${GREEN}[INFO]${NC} $*" >&2
+  printf '%b\n' "${GREEN}[INFO]${NC} $*" >&2
 }
 
 warn() {
-  echo -e "${YELLOW}[WARN]${NC} $*" >&2
+  printf '%b\n' "${YELLOW}[WARN]${NC} $*" >&2
 }
 
 error() {
-  echo -e "${RED}[ERROR]${NC} $*" >&2
+  printf '%b\n' "${RED}[ERROR]${NC} $*" >&2
   exit 1
 }
 
@@ -104,7 +108,7 @@ Required tools are missing.
 Install them on Linux Mint / Ubuntu with:
   sudo apt install curl unzip p7zip-full python3 build-essential
 
-Node.js 20+ with npm/npx is also required.
+Node.js 22.12+ with npm/npx is also required.
 Using nvm is fine as long as `node`, `npm`, and `npx` are available in PATH.
 EOF
 }
@@ -145,9 +149,83 @@ prepare_dirs() {
   fi
 }
 
+validate_configuration_paths() {
+  local resolved_project_dir=""
+  local resolved_output_root=""
+  local resolved_install_dir=""
+  local resolved_cache_dir=""
+  local resolved_build_log_dir=""
+
+  resolved_project_dir="$(realpath -m "$PROJECT_DIR")"
+  resolved_output_root="$(realpath -m "$OUTPUT_ROOT")"
+  resolved_install_dir="$(realpath -m "$INSTALL_DIR")"
+  resolved_cache_dir="$(realpath -m "$CACHE_DIR")"
+  resolved_build_log_dir="$(realpath -m "$BUILD_LOG_DIR")"
+
+  case "$resolved_install_dir" in
+    /|"$HOME"|"$resolved_project_dir"|"$resolved_output_root")
+      error "Unsafe runtime install directory: $resolved_install_dir"
+      ;;
+  esac
+
+  if [ "$(dirname "$resolved_install_dir")" = "/" ]; then
+    error "Runtime install directory must not be a top-level system directory: $resolved_install_dir"
+  fi
+
+  case "$resolved_project_dir/" in
+    "$resolved_install_dir/"*)
+      error "Runtime install directory must not contain the project directory: $resolved_install_dir"
+      ;;
+  esac
+
+  for protected_path in "$resolved_cache_dir" "$resolved_build_log_dir"; do
+    case "$protected_path/" in
+      "$resolved_install_dir/"*)
+        error "Runtime install directory must not contain cache or log data: $resolved_install_dir"
+        ;;
+    esac
+  done
+}
+
+validate_exact_version() {
+  local label="$1"
+  local version="$2"
+
+  if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+    error "$label must be an exact semantic version (found: $version)"
+  fi
+}
+
+download_file() {
+  local url="$1"
+  local destination_path="$2"
+  local label="$3"
+  local partial_path="${destination_path}.partial"
+
+  rm -f "$partial_path"
+  if ! curl \
+      --fail \
+      --location \
+      --progress-bar \
+      --connect-timeout 30 \
+      --max-time 900 \
+      --output "$partial_path" \
+      "$url"; then
+    rm -f "$partial_path"
+    error "Failed to download $label"
+  fi
+
+  if [ ! -s "$partial_path" ]; then
+    rm -f "$partial_path"
+    error "Download produced an empty file for $label"
+  fi
+
+  mv "$partial_path" "$destination_path"
+}
+
 check_deps() {
   local missing=()
-  local node_major=""
+  local node_version=""
 
   [ "$(uname -s)" = "Linux" ] || error "This script is intended to run on Linux."
 
@@ -168,9 +246,9 @@ check_deps() {
 $(dependency_help)"
   fi
 
-  node_major="$(node -v | cut -d. -f1 | tr -d v)"
-  if [ "$node_major" -lt 20 ]; then
-    error "Node.js 20+ is required (found $(node -v))"
+  node_version="$(node -p 'process.versions.node')"
+  if version_less_than "$node_version" "$MINIMUM_NODE_VERSION"; then
+    error "Node.js $MINIMUM_NODE_VERSION or newer is required (found $node_version)"
   fi
 
   if "$SEVEN_ZIP_CMD" | head -n 1 | grep -q "16.02"; then
@@ -193,9 +271,7 @@ resolve_dmg_path() {
   fi
 
   info "Downloading Codex App DMG from official OpenAI CDN"
-  curl -L --progress-bar --connect-timeout 30 --max-time 900 -o "$DMG_PATH" "$DMG_URL"
-
-  [ -s "$DMG_PATH" ] || error "Download failed or produced an empty file: $DMG_PATH"
+  download_file "$DMG_URL" "$DMG_PATH" "Codex App DMG"
 }
 
 extract_dmg() {
@@ -231,29 +307,34 @@ detect_electron_version() {
 
   if [ -n "${CODEX_ELECTRON_VERSION:-}" ]; then
     ELECTRON_VERSION="$CODEX_ELECTRON_VERSION"
+    validate_exact_version "Electron version" "$ELECTRON_VERSION"
     info "Using Electron override: $ELECTRON_VERSION"
     return
   fi
 
-  detected_electron_version="$(node -p "
-const packageJson = require('$extracted_asar_dir/package.json');
+  detected_electron_version="$(node -e '
+const packageJson = require(process.argv[1]);
 const candidates = [
   packageJson.devDependencies && packageJson.devDependencies.electron,
   packageJson.dependencies && packageJson.dependencies.electron,
   packageJson.electronVersion,
   packageJson.build && packageJson.build.electronVersion,
 ];
-const version = candidates.find((candidate) => typeof candidate === 'string' && candidate.length > 0);
-version ? version.replace(/^[^0-9]*/, '') : '';
-" 2>/dev/null || true)"
+const version = candidates.find((candidate) => typeof candidate === "string" && candidate.length > 0);
+if (version) {
+  process.stdout.write(version.replace(/^[^0-9]*/, ""));
+}
+' "$extracted_asar_dir/package.json" 2>/dev/null || true)"
 
   if [ -n "$detected_electron_version" ]; then
     ELECTRON_VERSION="$detected_electron_version"
+    validate_exact_version "Electron version" "$ELECTRON_VERSION"
     info "Detected Electron version from app bundle: $ELECTRON_VERSION"
     return
   fi
 
   ELECTRON_VERSION="$DEFAULT_ELECTRON_VERSION"
+  validate_exact_version "Electron version" "$ELECTRON_VERSION"
   warn "Could not detect Electron version from app bundle; falling back to $ELECTRON_VERSION"
 }
 
@@ -301,6 +382,19 @@ if (typeof declaredVersion === "string") {
 ' "$extracted_asar_dir/package.json" "$dependency_name"
 }
 
+read_installed_package_version() {
+  local extracted_asar_dir="$1"
+  local package_name="$2"
+
+  node -e '
+const path = require("path");
+const packageJson = require(path.join(process.argv[1], "node_modules", process.argv[2], "package.json"));
+if (typeof packageJson.version === "string") {
+  process.stdout.write(packageJson.version);
+}
+' "$extracted_asar_dir" "$package_name"
+}
+
 write_native_build_package_json() {
   local package_json_path="$1"
   local electron_version="$2"
@@ -308,19 +402,39 @@ write_native_build_package_json() {
   local node_pty_version="$4"
   local parcel_watcher_version="$5"
 
-  cat > "$package_json_path" <<EOF
-{
-  "name": "codex-app-linux-native-build",
-  "version": "1.0.0",
-  "private": true,
-  "dependencies": {
-    "electron": "$electron_version",
-    "better-sqlite3": "$better_sqlite3_version",
-    "node-pty": "$node_pty_version",
-    "@parcel/watcher": "$parcel_watcher_version"
-  }
-}
-EOF
+  validate_exact_version "Electron version" "$electron_version"
+  validate_exact_version "better-sqlite3 version" "$better_sqlite3_version"
+  validate_exact_version "node-pty version" "$node_pty_version"
+  validate_exact_version "@parcel/watcher version" "$parcel_watcher_version"
+
+  node - "$package_json_path" \
+    "$electron_version" \
+    "$better_sqlite3_version" \
+    "$node_pty_version" \
+    "$parcel_watcher_version" <<'NODE'
+const fs = require("fs");
+
+const [
+  packageJsonPath,
+  electronVersion,
+  betterSqlite3Version,
+  nodePtyVersion,
+  parcelWatcherVersion,
+] = process.argv.slice(2);
+const packageJson = {
+  name: "codex-app-linux-native-build",
+  version: "1.0.0",
+  private: true,
+  dependencies: {
+    electron: electronVersion,
+    "better-sqlite3": betterSqlite3Version,
+    "node-pty": nodePtyVersion,
+    "@parcel/watcher": parcelWatcherVersion,
+  },
+};
+
+fs.writeFileSync(packageJsonPath, `${JSON.stringify(packageJson, null, 2)}\n`, "utf8");
+NODE
 }
 
 install_rebuilt_native_modules() {
@@ -349,14 +463,18 @@ build_native_modules() {
   local node_pty_spawn_helper=""
   local parcel_watcher_binary=""
 
-  better_sqlite3_version="$(node -p "require('$extracted_asar_dir/node_modules/better-sqlite3/package.json').version" 2>/dev/null || true)"
-  node_pty_version="$(node -p "require('$extracted_asar_dir/node_modules/node-pty/package.json').version" 2>/dev/null || true)"
+  better_sqlite3_version="$(read_installed_package_version "$extracted_asar_dir" "better-sqlite3" 2>/dev/null || true)"
+  node_pty_version="$(read_installed_package_version "$extracted_asar_dir" "node-pty" 2>/dev/null || true)"
   parcel_watcher_version="$(detect_declared_dependency_version "$extracted_asar_dir" "@parcel/watcher" 2>/dev/null || true)"
 
   [ -n "$better_sqlite3_version" ] || error "Could not detect better-sqlite3 version in the app bundle"
   [ -n "$node_pty_version" ] || error "Could not detect node-pty version in the app bundle"
   [ -n "$parcel_watcher_version" ] || error "Could not detect @parcel/watcher version in the app bundle"
   better_sqlite3_build_version="$(resolve_better_sqlite3_build_version "$better_sqlite3_version" "$ELECTRON_VERSION")"
+  validate_exact_version "Electron version" "$ELECTRON_VERSION"
+  validate_exact_version "better-sqlite3 version" "$better_sqlite3_build_version"
+  validate_exact_version "node-pty version" "$node_pty_version"
+  validate_exact_version "@parcel/watcher version" "$parcel_watcher_version"
 
   info "Rebuilding native modules for Linux"
   if [ "$better_sqlite3_build_version" != "$better_sqlite3_version" ]; then
@@ -382,7 +500,7 @@ build_native_modules() {
   run_logged_command \
     "electron-rebuild for native modules" \
     "$BUILD_LOG_DIR/electron-rebuild.log" \
-    npx --yes @electron/rebuild -v "$ELECTRON_VERSION" --force
+    npx --yes "$ELECTRON_REBUILD_PACKAGE" -v "$ELECTRON_VERSION" --force
 
   better_sqlite3_binary="$(find "$native_build_dir/node_modules/better-sqlite3" -type f -name 'better_sqlite3.node' | head -n 1 || true)"
   node_pty_binary="$(find "$native_build_dir/node_modules/node-pty" -type f -name 'pty.node' | grep '/build/' | head -n 1 || true)"
@@ -406,10 +524,9 @@ patch_asar() {
 
   info "Extracting app.asar"
   cd "$WORK_DIR"
-  npx --yes asar extract "$resources_dir/app.asar" "$extracted_asar_dir" >&2
+  npx --yes "$ASAR_CLI_PACKAGE" extract "$resources_dir/app.asar" "$extracted_asar_dir" >&2
 
   if [ -d "$resources_dir/app.asar.unpacked" ]; then
-    cp -R "$resources_dir/app.asar.unpacked" "$WORK_DIR/"
     cp -R "$resources_dir/app.asar.unpacked/." "$extracted_asar_dir/"
   fi
 
@@ -438,7 +555,7 @@ patch_asar() {
   info "Repacking app.asar"
   cd "$WORK_DIR"
   rm -rf "$WORK_DIR/app.asar.unpacked"
-  npx --yes asar pack \
+  npx --yes "$ASAR_CLI_PACKAGE" pack \
     "$extracted_asar_dir" \
     "$WORK_DIR/app.asar" \
     --unpack "{*.node,*.so,*.dylib}" \
@@ -464,16 +581,20 @@ download_electron_runtime() {
 
   electron_url="https://github.com/electron/electron/releases/download/v${ELECTRON_VERSION}/electron-v${ELECTRON_VERSION}-linux-${electron_arch}.zip"
 
-  mkdir -p "$INSTALL_DIR"
-  rm -rf "$INSTALL_DIR"
-  mkdir -p "$INSTALL_DIR"
-
   if [ ! -s "$electron_zip" ]; then
     info "Downloading Electron runtime v${ELECTRON_VERSION}"
-    curl -L --progress-bar --connect-timeout 30 --max-time 900 -o "$electron_zip" "$electron_url"
+    download_file "$electron_url" "$electron_zip" "Electron runtime v${ELECTRON_VERSION}"
   else
     info "Using cached Electron runtime archive: $electron_zip"
   fi
+
+  if ! unzip -tq "$electron_zip" >/dev/null; then
+    rm -f "$electron_zip"
+    error "Electron runtime archive is invalid; removed cached file: $electron_zip"
+  fi
+
+  rm -rf "$INSTALL_DIR"
+  mkdir -p "$INSTALL_DIR"
 
   cd "$INSTALL_DIR"
   unzip -qo "$electron_zip"
@@ -516,6 +637,8 @@ WEBVIEW_DIR="$SCRIPT_DIR/content/webview"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/codex-app-linux"
 LOG_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/codex-app-linux"
 WEBVIEW_PID_FILE="$STATE_DIR/webview.pid"
+WEBVIEW_PID=""
+OWNS_WEBVIEW_SERVER=0
 LAUNCHER_LOG_FILE="$LOG_DIR/launcher.log"
 DEFAULT_LAUNCHER_LOG_MAX_BYTES=10485760
 LAUNCHER_LOG_MAX_BYTES="${CODEX_LAUNCHER_LOG_MAX_BYTES:-$DEFAULT_LAUNCHER_LOG_MAX_BYTES}"
@@ -557,6 +680,26 @@ if [ -f "$LAUNCHER_LOG_FILE" ] &&
 fi
 
 exec >>"$LAUNCHER_LOG_FILE" 2>&1
+
+cleanup_launcher() {
+  local launcher_status=$?
+  local recorded_pid=""
+
+  if [ "$OWNS_WEBVIEW_SERVER" -eq 1 ] && [ -n "$WEBVIEW_PID" ]; then
+    kill "$WEBVIEW_PID" 2>/dev/null || true
+    wait "$WEBVIEW_PID" 2>/dev/null || true
+    recorded_pid="$(cat "$WEBVIEW_PID_FILE" 2>/dev/null || true)"
+    if [ "$recorded_pid" = "$WEBVIEW_PID" ]; then
+      rm -f "$WEBVIEW_PID_FILE"
+    fi
+  fi
+
+  trim_launcher_log "$LAUNCHER_LOG_FILE"
+  trap - EXIT
+  exit "$launcher_status"
+}
+
+trap cleanup_launcher EXIT
 
 resolve_codex_cli() {
   local candidate=""
@@ -709,16 +852,28 @@ check_for_conflicting_installation() {
   return 1
 }
 
-clear_stale_webview_pid() {
-  if [ ! -f "$WEBVIEW_PID_FILE" ]; then
-    return
+is_webview_port_open() {
+  python3 -c "import socket; socket.create_connection(('127.0.0.1', 5175), 0.3).close()" \
+    2>/dev/null
+}
+
+is_compatible_webview_server_running() {
+  local recorded_pid=""
+  local running_directory=""
+
+  recorded_pid="$(cat "$WEBVIEW_PID_FILE" 2>/dev/null || true)"
+  case "$recorded_pid" in
+    ''|*[!0-9]*)
+      return 1
+      ;;
+  esac
+
+  if ! kill -0 "$recorded_pid" 2>/dev/null; then
+    return 1
   fi
 
-  local pid=""
-  pid="$(cat "$WEBVIEW_PID_FILE" 2>/dev/null || true)"
-  if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
-    rm -f "$WEBVIEW_PID_FILE"
-  fi
+  running_directory="$(readlink -f "/proc/$recorded_pid/cwd" 2>/dev/null || true)"
+  [ "$running_directory" = "$(readlink -f "$WEBVIEW_DIR")" ] && is_webview_port_open
 }
 
 start_webview_server() {
@@ -728,20 +883,38 @@ start_webview_server() {
     return 0
   fi
 
-  clear_stale_webview_pid
+  if is_compatible_webview_server_running; then
+    return 0
+  fi
+
+  rm -f "$WEBVIEW_PID_FILE"
+  if is_webview_port_open; then
+    error_message="Port 5175 is already used by a process other than this Codex Desktop build."
+    echo "$error_message" >&2
+    echo "$error_message" >&3
+    notify_launch_failure "$error_message"
+    return 1
+  fi
 
   (
     cd "$WEBVIEW_DIR"
     exec python3 -m http.server 5175 --bind 127.0.0.1 >/dev/null 2>&1
   ) &
 
-  echo "$!" > "$WEBVIEW_PID_FILE"
-  trap 'kill "$(cat "$WEBVIEW_PID_FILE" 2>/dev/null || true)" 2>/dev/null || true; rm -f "$WEBVIEW_PID_FILE"' EXIT
+  WEBVIEW_PID="$!"
+  OWNS_WEBVIEW_SERVER=1
+  echo "$WEBVIEW_PID" > "$WEBVIEW_PID_FILE"
 
   local attempt=""
   for attempt in $(seq 1 50); do
-    if python3 -c "import socket; s=socket.socket(); s.settimeout(0.3); s.connect(('127.0.0.1', 5175)); s.close()" 2>/dev/null; then
-      return 0
+    if is_webview_port_open; then
+      if kill -0 "$WEBVIEW_PID" 2>/dev/null; then
+        return 0
+      fi
+      break
+    fi
+    if ! kill -0 "$WEBVIEW_PID" 2>/dev/null; then
+      break
     fi
     sleep 0.1
   done
@@ -809,14 +982,11 @@ install_desktop_entry() {
 
   [ -x "$exec_path" ] || error "Launcher not found: $exec_path"
   [ -f "$DESKTOP_TEMPLATE" ] || error "Desktop template not found: $DESKTOP_TEMPLATE"
+  [ -f "$DESKTOP_ENTRY_RENDER_SCRIPT" ] || error "Desktop entry renderer not found: $DESKTOP_ENTRY_RENDER_SCRIPT"
 
   mkdir -p "$(dirname "$DESKTOP_FILE_PATH")"
 
-  sed \
-    -e "s|__EXEC__|$exec_path|g" \
-    -e "s|__TRYEXEC__|$exec_path|g" \
-    -e "s|__ICON__|$icon_path|g" \
-    "$DESKTOP_TEMPLATE" > "$temp_file"
+  node "$DESKTOP_ENTRY_RENDER_SCRIPT" "$DESKTOP_TEMPLATE" "$temp_file" "$exec_path" "$icon_path"
 
   if command -v desktop-file-validate >/dev/null 2>&1; then
     desktop-file-validate "$temp_file"
@@ -828,9 +998,11 @@ install_desktop_entry() {
 
 main() {
   local extracted_app_dir=""
+  local desktop_file_summary="Not refreshed (--skip-desktop-entry)"
 
   parse_args "$@"
   check_deps
+  validate_configuration_paths
   prepare_dirs
   resolve_dmg_path
 
@@ -842,6 +1014,7 @@ main() {
 
   if [ "$INSTALL_DESKTOP_ENTRY" -eq 1 ]; then
     install_desktop_entry
+    desktop_file_summary="$DESKTOP_FILE_PATH"
   fi
 
   cat >&2 <<EOF
@@ -850,7 +1023,7 @@ main() {
 Temporary Codex App Linux port is ready
 ============================================
 Launcher:      $INSTALL_DIR/start.sh
-Desktop file:  $DESKTOP_FILE_PATH
+Desktop file:  $desktop_file_summary
 Runtime dir:   $INSTALL_DIR
 
 You can start it with:
@@ -858,4 +1031,6 @@ You can start it with:
 EOF
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

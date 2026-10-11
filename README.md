@@ -1,5 +1,10 @@
 # Codex App Mint Port
 
+---
+NOTE:
+As OpenAI released the Linux version of Codex, this port is no longer needed. It will be archived.
+---
+
 Temporary, local Linux Mint Cinnamon porting flow for the macOS-only Codex App.
 
 This repository does not redistribute the app itself. It rebuilds a local runtime from the official OpenAI `Codex.dmg`.
@@ -40,7 +45,7 @@ sudo apt install curl unzip p7zip-full python3 build-essential
 
 You also need:
 
-- Node.js 20+
+- Node.js 22.12+
 - `npm`
 - `npx`
 - an installed Codex CLI available in `PATH`, reachable through `CODEX_CLI_PATH`, or installed under `~/.nvm/versions/node`
@@ -120,6 +125,16 @@ If another Codex Desktop installation owns the default profile lock, the termina
 - the upstream bundle still contains `better-sqlite3` and `node-pty`, and declares an installable `@parcel/watcher` version
 
 If OpenAI changes the bundle structure, the patch step may need to be updated.
+
+## Validation
+
+Run the repository's syntax checks, regression tests, and whitespace validation with:
+
+```bash
+bash tests/run-all.sh
+```
+
+The regression suite uses local fixtures and does not download the Codex app or npm packages. A complete port rebuild remains the integration check for compatibility with the current upstream bundle.
 
 ## License
 
