@@ -6,6 +6,7 @@ PROJECT_DIR="$SCRIPT_DIR"
 PATCH_SCRIPT="$PROJECT_DIR/scripts/patch-linux-window-ui.js"
 NATIVE_MODULE_PATCH_SCRIPT="$PROJECT_DIR/scripts/patch-native-module-loaders.js"
 OWL_FEATURES_PATCH_SCRIPT="$PROJECT_DIR/scripts/patch-owl-features-fallback.js"
+NATIVE_MODULE_COPY_SCRIPT="$PROJECT_DIR/scripts/copy-node-module-closure.js"
 DESKTOP_TEMPLATE="$PROJECT_DIR/templates/codex-desktop.desktop.in"
 
 OUTPUT_ROOT="${CODEX_PORT_OUTPUT_ROOT:-$PROJECT_DIR/runtime}"
@@ -92,6 +93,7 @@ Environment variables:
   CODEX_PORT_INSTALL_DIR     Override the app install directory (default: ./runtime/codex-app).
   CODEX_PORT_CACHE_DIR       Override the cache directory (default: ./runtime/cache).
   CODEX_DESKTOP_FILE_PATH    Override the installed desktop entry path.
+  CODEX_LAUNCHER_LOG_MAX_BYTES Override the launcher log size limit (default: 10485760).
 EOF
 }
 
@@ -285,44 +287,92 @@ resolve_better_sqlite3_build_version() {
   printf '%s\n' "$detected_version"
 }
 
+detect_declared_dependency_version() {
+  local extracted_asar_dir="$1"
+  local dependency_name="$2"
+
+  node -e '
+const packageJson = require(process.argv[1]);
+const dependencyName = process.argv[2];
+const declaredVersion = packageJson.dependencies?.[dependencyName];
+if (typeof declaredVersion === "string") {
+  process.stdout.write(declaredVersion.replace(/^[^0-9]*/, ""));
+}
+' "$extracted_asar_dir/package.json" "$dependency_name"
+}
+
+write_native_build_package_json() {
+  local package_json_path="$1"
+  local electron_version="$2"
+  local better_sqlite3_version="$3"
+  local node_pty_version="$4"
+  local parcel_watcher_version="$5"
+
+  cat > "$package_json_path" <<EOF
+{
+  "name": "codex-app-linux-native-build",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "electron": "$electron_version",
+    "better-sqlite3": "$better_sqlite3_version",
+    "node-pty": "$node_pty_version",
+    "@parcel/watcher": "$parcel_watcher_version"
+  }
+}
+EOF
+}
+
+install_rebuilt_native_modules() {
+  local source_node_modules_dir="$1"
+  local target_node_modules_dir="$2"
+
+  mkdir -p "$target_node_modules_dir"
+  rm -rf "$target_node_modules_dir/better-sqlite3" "$target_node_modules_dir/node-pty"
+  cp -R "$source_node_modules_dir/better-sqlite3" "$target_node_modules_dir/"
+  cp -R "$source_node_modules_dir/node-pty" "$target_node_modules_dir/"
+  node "$NATIVE_MODULE_COPY_SCRIPT" \
+    "$source_node_modules_dir" \
+    "$target_node_modules_dir" \
+    "@parcel/watcher"
+}
+
 build_native_modules() {
   local extracted_asar_dir="$1"
   local native_build_dir="$WORK_DIR/native-build"
   local better_sqlite3_version=""
   local better_sqlite3_build_version=""
   local node_pty_version=""
+  local parcel_watcher_version=""
   local better_sqlite3_binary=""
   local node_pty_binary=""
   local node_pty_spawn_helper=""
+  local parcel_watcher_binary=""
 
   better_sqlite3_version="$(node -p "require('$extracted_asar_dir/node_modules/better-sqlite3/package.json').version" 2>/dev/null || true)"
   node_pty_version="$(node -p "require('$extracted_asar_dir/node_modules/node-pty/package.json').version" 2>/dev/null || true)"
+  parcel_watcher_version="$(detect_declared_dependency_version "$extracted_asar_dir" "@parcel/watcher" 2>/dev/null || true)"
 
   [ -n "$better_sqlite3_version" ] || error "Could not detect better-sqlite3 version in the app bundle"
   [ -n "$node_pty_version" ] || error "Could not detect node-pty version in the app bundle"
+  [ -n "$parcel_watcher_version" ] || error "Could not detect @parcel/watcher version in the app bundle"
   better_sqlite3_build_version="$(resolve_better_sqlite3_build_version "$better_sqlite3_version" "$ELECTRON_VERSION")"
 
   info "Rebuilding native modules for Linux"
   if [ "$better_sqlite3_build_version" != "$better_sqlite3_version" ]; then
     warn "Using better-sqlite3@$better_sqlite3_build_version for Electron $ELECTRON_VERSION; app bundle contains $better_sqlite3_version"
   fi
-  info "better-sqlite3@$better_sqlite3_build_version, node-pty@$node_pty_version, electron@$ELECTRON_VERSION"
+  info "better-sqlite3@$better_sqlite3_build_version, node-pty@$node_pty_version, @parcel/watcher@$parcel_watcher_version, electron@$ELECTRON_VERSION"
 
   mkdir -p "$native_build_dir"
   cd "$native_build_dir"
 
-  cat > package.json <<EOF
-{
-  "name": "codex-app-linux-native-build",
-  "version": "1.0.0",
-  "private": true,
-  "dependencies": {
-    "electron": "$ELECTRON_VERSION",
-    "better-sqlite3": "$better_sqlite3_build_version",
-    "node-pty": "$node_pty_version"
-  }
-}
-EOF
+  write_native_build_package_json \
+    "$native_build_dir/package.json" \
+    "$ELECTRON_VERSION" \
+    "$better_sqlite3_build_version" \
+    "$node_pty_version" \
+    "$parcel_watcher_version"
 
   run_logged_command \
     "npm install for native module rebuild" \
@@ -337,14 +387,14 @@ EOF
   better_sqlite3_binary="$(find "$native_build_dir/node_modules/better-sqlite3" -type f -name 'better_sqlite3.node' | head -n 1 || true)"
   node_pty_binary="$(find "$native_build_dir/node_modules/node-pty" -type f -name 'pty.node' | grep '/build/' | head -n 1 || true)"
   node_pty_spawn_helper="$(find "$native_build_dir/node_modules/node-pty" -type f -name 'spawn-helper' | grep '/build/' | head -n 1 || true)"
+  parcel_watcher_binary="$(find "$native_build_dir/node_modules/@parcel" -type f -name '*.node' | head -n 1 || true)"
 
   [ -n "$better_sqlite3_binary" ] || error "better-sqlite3 rebuild did not produce better_sqlite3.node"
   [ -n "$node_pty_binary" ] || error "node-pty rebuild did not produce a Linux pty.node"
   [ -n "$node_pty_spawn_helper" ] || warn "node-pty rebuild did not produce spawn-helper; continuing"
+  [ -n "$parcel_watcher_binary" ] || error "@parcel/watcher install did not produce a Linux native module"
 
-  rm -rf "$extracted_asar_dir/node_modules/better-sqlite3" "$extracted_asar_dir/node_modules/node-pty"
-  cp -R "$native_build_dir/node_modules/better-sqlite3" "$extracted_asar_dir/node_modules/"
-  cp -R "$native_build_dir/node_modules/node-pty" "$extracted_asar_dir/node_modules/"
+  install_rebuilt_native_modules "$native_build_dir/node_modules" "$extracted_asar_dir/node_modules"
 }
 
 patch_asar() {
@@ -467,8 +517,45 @@ STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/codex-app-linux"
 LOG_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/codex-app-linux"
 WEBVIEW_PID_FILE="$STATE_DIR/webview.pid"
 LAUNCHER_LOG_FILE="$LOG_DIR/launcher.log"
+DEFAULT_LAUNCHER_LOG_MAX_BYTES=10485760
+LAUNCHER_LOG_MAX_BYTES="${CODEX_LAUNCHER_LOG_MAX_BYTES:-$DEFAULT_LAUNCHER_LOG_MAX_BYTES}"
 
 mkdir -p "$STATE_DIR" "$LOG_DIR"
+
+if [ -t 2 ] || [ "${CODEX_LAUNCHER_STDERR:-0}" = "1" ]; then
+  exec 3>&2
+else
+  exec 3>/dev/null
+fi
+
+case "$LAUNCHER_LOG_MAX_BYTES" in
+  ''|*[!0-9]*)
+    LAUNCHER_LOG_MAX_BYTES="$DEFAULT_LAUNCHER_LOG_MAX_BYTES"
+    ;;
+esac
+
+trim_launcher_log() {
+  local log_path="$1"
+  local trimmed_log_path="$log_path.trimmed"
+
+  if [ ! -f "$log_path" ] ||
+    [ "$(wc -c < "$log_path")" -le "$LAUNCHER_LOG_MAX_BYTES" ]; then
+    return 0
+  fi
+
+  tail -c "$LAUNCHER_LOG_MAX_BYTES" "$log_path" > "$trimmed_log_path"
+  mv "$trimmed_log_path" "$log_path"
+}
+
+trim_launcher_log "$LAUNCHER_LOG_FILE.1"
+
+if [ -f "$LAUNCHER_LOG_FILE" ] &&
+  [ "$(wc -c < "$LAUNCHER_LOG_FILE")" -gt "$LAUNCHER_LOG_MAX_BYTES" ]; then
+  rm -f "$LAUNCHER_LOG_FILE.1"
+  mv "$LAUNCHER_LOG_FILE" "$LAUNCHER_LOG_FILE.1"
+  trim_launcher_log "$LAUNCHER_LOG_FILE.1"
+fi
+
 exec >>"$LAUNCHER_LOG_FILE" 2>&1
 
 resolve_codex_cli() {
@@ -500,6 +587,47 @@ resolve_codex_cli() {
   return 1
 }
 
+check_for_conflicting_installation() {
+  local default_user_data_directory="${XDG_CONFIG_HOME:-$HOME/.config}/Codex"
+  local singleton_lock_path="$default_user_data_directory/SingletonLock"
+  local singleton_lock_target=""
+  local running_hostname=""
+  local running_pid=""
+  local running_executable_path=""
+  local current_executable_path=""
+  local error_message=""
+
+  if [ -n "${CODEX_ELECTRON_USER_DATA_PATH:-}" ] || [ ! -L "$singleton_lock_path" ]; then
+    return 0
+  fi
+
+  singleton_lock_target="$(readlink "$singleton_lock_path" 2>/dev/null || true)"
+  running_hostname="${singleton_lock_target%-*}"
+  running_pid="${singleton_lock_target##*-}"
+  case "$running_pid" in
+    ''|*[!0-9]*)
+      return 0
+      ;;
+  esac
+
+  if [ "$running_hostname" != "$(hostname)" ] || ! kill -0 "$running_pid" 2>/dev/null; then
+    return 0
+  fi
+
+  running_executable_path="$(readlink "/proc/$running_pid/exe" 2>/dev/null || true)"
+  current_executable_path="$(readlink -f "$SCRIPT_DIR/electron" 2>/dev/null || true)"
+  if [ -z "$running_executable_path" ] ||
+    [ -z "$current_executable_path" ] ||
+    [ "$running_executable_path" = "$current_executable_path" ]; then
+    return 0
+  fi
+
+  error_message="A different Codex Desktop installation is already running (PID $running_pid). Close it before starting this build. Running executable: $running_executable_path"
+  echo "$error_message" >&2
+  echo "$error_message" >&3
+  return 1
+}
+
 clear_stale_webview_pid() {
   if [ ! -f "$WEBVIEW_PID_FILE" ]; then
     return
@@ -521,7 +649,7 @@ start_webview_server() {
 
   (
     cd "$WEBVIEW_DIR"
-    python3 -m http.server 5175 --bind 127.0.0.1 >/dev/null 2>&1
+    exec python3 -m http.server 5175 --bind 127.0.0.1 >/dev/null 2>&1
   ) &
 
   echo "$!" > "$WEBVIEW_PID_FILE"
@@ -541,6 +669,7 @@ start_webview_server() {
 
 main() {
   local codex_cli_path=""
+  local electron_status=0
 
   codex_cli_path="$(resolve_codex_cli || true)"
   if [ -z "$codex_cli_path" ]; then
@@ -553,16 +682,26 @@ main() {
   export NODE_ENV=production
   export CHROME_DESKTOP="${CHROME_DESKTOP:-codex-desktop.desktop}"
 
+  check_for_conflicting_installation
   start_webview_server
 
-  exec "$SCRIPT_DIR/electron" \
-    --no-sandbox \
-    --class=codex-desktop \
-    --app-id=codex-desktop \
-    --ozone-platform-hint=auto \
-    --disable-gpu-sandbox \
-    --enable-features=WaylandWindowDecorations \
-    "$@"
+  if "$SCRIPT_DIR/electron" \
+      --no-sandbox \
+      --class=codex-desktop \
+      --app-id=codex-desktop \
+      --ozone-platform-hint=auto \
+      --disable-gpu-sandbox \
+      --enable-features=WaylandWindowDecorations \
+      "$@"; then
+    return 0
+  else
+    electron_status=$?
+  fi
+
+  echo "Codex Desktop failed to start (exit code $electron_status)." >&3
+  echo "Launcher log: $LAUNCHER_LOG_FILE" >&3
+  tail -n 40 "$LAUNCHER_LOG_FILE" >&3 || true
+  return "$electron_status"
 }
 
 main "$@"

@@ -13,16 +13,30 @@ try {
   const buildDir = path.join(tempDir, ".vite", "build");
   fs.mkdirSync(buildDir, { recursive: true });
 
-  const bootstrapPath = path.join(buildDir, "bootstrap.js");
+  fs.writeFileSync(
+    path.join(tempDir, "package.json"),
+    JSON.stringify({ main: ".vite/build/early-bootstrap.js" }),
+    "utf8",
+  );
+
+  const electronModuleDir = path.join(tempDir, "node_modules", "electron");
+  fs.mkdirSync(electronModuleDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(electronModuleDir, "index.js"),
+    "module.exports = { app: { whenReady: () => Promise.resolve() }, BrowserWindow: {}, session: { fromPartition: () => ({}) } };\n",
+    "utf8",
+  );
+
+  const bootstrapPath = path.join(buildDir, "early-bootstrap.js");
   fs.writeFileSync(
     bootstrapPath,
-    "require('./workspace-root-drop-handler.js');\n",
+    "require('./bootstrap-test-hash.js');\n",
     "utf8",
   );
 
   const featureProbePath = path.join(buildDir, "feature-probe.txt");
   fs.writeFileSync(
-    path.join(buildDir, "workspace-root-drop-handler.js"),
+    path.join(tempDir, "owl-feature-consumer.js"),
     [
       "const fs = require('fs');",
       `const featureProbePath = ${JSON.stringify(featureProbePath)};`,
@@ -34,6 +48,41 @@ try {
       "",
     ].join("\n"),
     "utf8",
+  );
+
+  fs.writeFileSync(
+    path.join(buildDir, "bootstrap-test-hash.js"),
+    [
+      "const { app, session } = require('electron');",
+      "if (process.versions.electron != null && typeof app.showTaskManager !== 'function') {",
+      "  throw new Error('Codex requires the Owl app shell; stock Electron is no longer supported.');",
+      "}",
+      "if (app.isRuntimeFeatureEnabled('test-feature')) {",
+      "  throw new Error('stock Electron fallback should disable runtime features');",
+      "}",
+      "app.setDebugChromePagesEnabled(false);",
+      "session.fromPartition('test').setPreferredLanguages(['en']);",
+      "require('../../owl-feature-consumer.js');",
+      "async function startMainApp(){try{return true}catch(startupError){console.error('Desktop bootstrap failed to start the main app')}}",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const runtimeArguments = [
+    "-e",
+    "process.versions.electron = '42.3.0'; require(process.argv[1]);",
+    bootstrapPath,
+  ];
+
+  const unpatchedRuntimeResult = spawnSync(process.execPath, runtimeArguments, {
+    encoding: "utf8",
+  });
+
+  assert.notStrictEqual(unpatchedRuntimeResult.status, 0);
+  assert.match(
+    unpatchedRuntimeResult.stderr,
+    /Codex requires the Owl app shell; stock Electron is no longer supported/,
   );
 
   const patchResult = spawnSync(
@@ -51,8 +100,15 @@ try {
   const bootstrapSource = fs.readFileSync(bootstrapPath, "utf8");
   assert.match(bootstrapSource, /electron_common_owl_features/);
   assert.match(bootstrapSource, /originalLinkedBinding/);
+  assert.match(bootstrapSource, /showTaskManager/);
 
-  const runtimeResult = spawnSync(process.execPath, [bootstrapPath], {
+  const hashedBootstrapSource = fs.readFileSync(
+    path.join(buildDir, "bootstrap-test-hash.js"),
+    "utf8",
+  );
+  assert.match(hashedBootstrapSource, /\[codex-linux\] Desktop bootstrap failed/);
+
+  const runtimeResult = spawnSync(process.execPath, runtimeArguments, {
     encoding: "utf8",
   });
 
