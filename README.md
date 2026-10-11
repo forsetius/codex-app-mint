@@ -43,7 +43,7 @@ You also need:
 - Node.js 20+
 - `npm`
 - `npx`
-- an installed Codex CLI available in `PATH`, or reachable through `CODEX_CLI_PATH`
+- an installed Codex CLI available in `PATH`, reachable through `CODEX_CLI_PATH`, or installed under `~/.nvm/versions/node`
 
 ## Usage
 
@@ -95,6 +95,12 @@ The generated desktop entry is:
 ~/.local/share/applications/codex-desktop.desktop
 ```
 
+You can launch the installed desktop entry from a terminal with:
+
+```bash
+gtk-launch codex-desktop
+```
+
 Launcher output is stored in:
 
 ```bash
@@ -102,6 +108,8 @@ Launcher output is stored in:
 ```
 
 The launcher keeps the current log and one rotated log, each bounded to 10 MiB by default. Set `CODEX_LAUNCHER_LOG_MAX_BYTES` to override that limit.
+
+When `notify-send` is available, critical launch failures also produce a desktop notification.
 
 If another Codex Desktop installation owns the default profile lock, the terminal launcher reports its PID and executable path. Close that instance before starting the rebuilt app.
 
