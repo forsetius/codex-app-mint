@@ -1,5 +1,10 @@
 # Codex App Mint Port
 
+---
+NOTE:
+As OpenAI released the Linux version of Codex, this port is no longer needed. It will be archived.
+---
+
 Temporary, local Linux Mint Cinnamon porting flow for the macOS-only Codex App.
 
 This repository does not redistribute the app itself. It rebuilds a local runtime from the official OpenAI `Codex.dmg`.
