@@ -10,10 +10,6 @@ cleanup() {
 
 trap cleanup EXIT
 
-source_script_without_main() {
-  sed '$d' "$REPO_DIR/port-codex-app-mint.sh"
-}
-
 assert_file_exists() {
   local file_path="$1"
   local label="$2"
@@ -25,11 +21,12 @@ assert_file_exists() {
 }
 
 (
-  source <(source_script_without_main)
+  source "$REPO_DIR/port-codex-app-mint.sh"
   NATIVE_MODULE_COPY_SCRIPT="$REPO_DIR/scripts/copy-node-module-closure.js"
 
   mkdir -p "$TEMP_DIR/app" "$TEMP_DIR/native-node-modules/@parcel/watcher"
   mkdir -p "$TEMP_DIR/native-node-modules/@parcel/watcher-linux-x64-glibc"
+  mkdir -p "$TEMP_DIR/native-node-modules/@parcel/watcher/node_modules/nested-dependency"
   mkdir -p "$TEMP_DIR/native-node-modules/better-sqlite3"
   mkdir -p "$TEMP_DIR/native-node-modules/node-pty"
   mkdir -p "$TEMP_DIR/native-node-modules/picomatch"
@@ -66,15 +63,18 @@ JSON
 {
   "name": "@parcel/watcher",
   "dependencies": {
-    "picomatch": "4.0.3"
+    "picomatch": "4.0.3",
+    "nested-dependency": "2.0.0"
   },
   "optionalDependencies": {
-    "@parcel/watcher-linux-x64-glibc": "2.5.6"
+    "@parcel/watcher-linux-x64-glibc": "2.5.6",
+    "missing-platform-package": "1.0.0"
   }
 }
 JSON
   printf '{"name":"@parcel/watcher-linux-x64-glibc"}\n' > "$TEMP_DIR/native-node-modules/@parcel/watcher-linux-x64-glibc/package.json"
   printf '{"name":"picomatch"}\n' > "$TEMP_DIR/native-node-modules/picomatch/package.json"
+  printf '{"name":"nested-dependency","version":"2.0.0"}\n' > "$TEMP_DIR/native-node-modules/@parcel/watcher/node_modules/nested-dependency/package.json"
   printf 'parcel binary\n' > "$TEMP_DIR/native-node-modules/@parcel/watcher-linux-x64-glibc/watcher.node"
   printf 'sqlite binary\n' > "$TEMP_DIR/native-node-modules/better-sqlite3/better_sqlite3.node"
   printf 'pty binary\n' > "$TEMP_DIR/native-node-modules/node-pty/pty.node"
@@ -84,6 +84,37 @@ JSON
   assert_file_exists "$TEMP_DIR/app/node_modules/@parcel/watcher/package.json" "missing @parcel/watcher package"
   assert_file_exists "$TEMP_DIR/app/node_modules/@parcel/watcher-linux-x64-glibc/watcher.node" "missing Linux watcher binary"
   assert_file_exists "$TEMP_DIR/app/node_modules/picomatch/package.json" "missing transitive watcher dependency"
+  assert_file_exists "$TEMP_DIR/app/node_modules/@parcel/watcher/node_modules/nested-dependency/package.json" "missing nested watcher dependency"
+  if [ -e "$TEMP_DIR/app/node_modules/nested-dependency" ]; then
+    printf 'FAIL: nested dependency was incorrectly flattened into the target node_modules\n' >&2
+    exit 1
+  fi
 )
+
+mkdir -p "$TEMP_DIR/broken-node-modules/root-package"
+cat > "$TEMP_DIR/broken-node-modules/root-package/package.json" <<'JSON'
+{
+  "name": "root-package",
+  "dependencies": {
+    "missing-required-package": "1.0.0"
+  }
+}
+JSON
+
+if node "$REPO_DIR/scripts/copy-node-module-closure.js" \
+  "$TEMP_DIR/broken-node-modules" \
+  "$TEMP_DIR/broken-target-node-modules" \
+  "root-package" >/dev/null 2>&1; then
+  printf 'FAIL: missing required dependency did not fail closure copying\n' >&2
+  exit 1
+fi
+
+if node "$REPO_DIR/scripts/copy-node-module-closure.js" \
+  "$TEMP_DIR/native-node-modules" \
+  "$TEMP_DIR/native-node-modules/target" \
+  "@parcel/watcher" >/dev/null 2>&1; then
+  printf 'FAIL: overlapping source and target node_modules directories were accepted\n' >&2
+  exit 1
+fi
 
 printf 'parcel-watcher-build tests passed\n'

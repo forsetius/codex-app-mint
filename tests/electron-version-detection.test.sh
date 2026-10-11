@@ -10,10 +10,6 @@ cleanup() {
 
 trap cleanup EXIT
 
-source_script_without_main() {
-  sed '$d' "$REPO_DIR/port-codex-app-mint.sh"
-}
-
 assert_equals() {
   local expected="$1"
   local actual="$2"
@@ -34,7 +30,7 @@ run_detection() {
 
   (
     set -Eeuo pipefail
-    source <(source_script_without_main)
+    source "$REPO_DIR/port-codex-app-mint.sh"
     if [ -n "$override" ]; then
       CODEX_ELECTRON_VERSION="$override"
       ELECTRON_VERSION="$CODEX_ELECTRON_VERSION"

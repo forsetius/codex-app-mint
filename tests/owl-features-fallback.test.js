@@ -44,7 +44,18 @@ try {
       "if (owlFeatures.isOwlFeatureEnabled('drop-handler')) {",
       "  throw new Error('fallback should disable OWL features');",
       "}",
-      "fs.writeFileSync(featureProbePath, 'disabled', 'utf8');",
+      "const { session } = require('electron');",
+      "const browserSession = session.fromPartition('fallback-test');",
+      "Promise.all([",
+      "  browserSession.searchHistory({ text: '' }),",
+      "  browserSession.getBrowsingDataSettings(),",
+      "  browserSession.faviconService.getFaviconForPageURL('https://example.com'),",
+      "]).then(([history, settings, favicon]) => {",
+      "  if (history.length !== 0 || settings.dataRemovalPermitted.history !== false || favicon !== null) {",
+      "    throw new Error('session fallbacks returned unexpected values');",
+      "  }",
+      "  fs.writeFileSync(featureProbePath, 'disabled', 'utf8');",
+      "});",
       "",
     ].join("\n"),
     "utf8",
@@ -62,6 +73,8 @@ try {
       "}",
       "app.setDebugChromePagesEnabled(false);",
       "session.fromPartition('test').setPreferredLanguages(['en']);",
+      "const downloadStore={async readNativeHistory(){return this.browserSession==null?null:(await this.browserSession.getDownloadHistory()).filter(XK)},async searchDownloadHistory(e){return this.browserSession==null?null:(await this.browserSession.searchDownloadHistory(e)).filter(XK)}};",
+      "async function summarizeDownloads(){return this.browserSession.getDownloadHistory().catch(()=>null)}",
       "require('../../owl-feature-consumer.js');",
       "async function startMainApp(){try{return true}catch(startupError){console.error('Desktop bootstrap failed to start the main app')}}",
       "",
@@ -107,6 +120,15 @@ try {
     "utf8",
   );
   assert.match(hashedBootstrapSource, /\[codex-linux\] Desktop bootstrap failed/);
+  assert.match(
+    hashedBootstrapSource,
+    /typeof this\.browserSession\.getDownloadHistory!==`function`\?null/,
+  );
+  assert.match(
+    hashedBootstrapSource,
+    /typeof this\.browserSession\.searchDownloadHistory!==`function`\?null/,
+  );
+  assert.match(hashedBootstrapSource, /getDownloadHistory\?\.\(\)/);
 
   const runtimeResult = spawnSync(process.execPath, runtimeArguments, {
     encoding: "utf8",

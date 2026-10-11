@@ -14,25 +14,26 @@ const assetsDir = path.join(extractedDir, "webview", "assets");
 const buildDir = path.join(extractedDir, ".vite", "build");
 
 if (!fs.existsSync(assetsDir) || !fs.existsSync(buildDir)) {
-  console.warn("WARN: Required directories for UI patching were not found. Skipping.");
-  process.exit(0);
+  throw new Error("Required directories for UI patching were not found");
 }
 
 const iconAsset = fs
   .readdirSync(assetsDir)
+  .sort()
   .find((name) => /^app-.*\.png$/.test(name));
 
 const mainBundle = fs
   .readdirSync(buildDir)
+  .sort()
   .find((name) => /^main(?:-[^.]+)?\.js$/.test(name));
 
 if (!iconAsset || !mainBundle) {
-  console.warn("WARN: Could not find the icon asset or the main Vite bundle. Skipping.");
-  process.exit(0);
+  throw new Error("Could not find the icon asset or the main Vite bundle");
 }
 
 const target = path.join(buildDir, mainBundle);
 let source = fs.readFileSync(target, "utf8");
+const originalSource = source;
 const packageJsonPath = path.join(extractedDir, "package.json");
 const linuxIconPathExpression = `require(\`node:path\`).join(process.resourcesPath,\`..\`,\`content\`,\`webview\`,\`assets\`,\`${iconAsset}\`)`;
 
@@ -77,6 +78,17 @@ if (colorMatch) {
       source = source.replace(backgroundNeedle, backgroundReplacement);
     }
   }
+}
+
+const knownPatchMarkers = [
+  "process.platform===`win32`||process.platform===`linux`?{autoHideMenuBar",
+  "process.platform===`linux`&&D.setMenuBarVisibility(!1)",
+  "process.platform===`linux`&&D.setIcon(",
+  "process.platform===`linux`&&!f5(e)||m5(",
+  "process.platform===`linux`?{backgroundColor:",
+];
+if (source === originalSource && !knownPatchMarkers.some((patchMarker) => source.includes(patchMarker))) {
+  throw new Error(`No recognized Linux window patch points were found in ${target}`);
 }
 
 fs.writeFileSync(target, source, "utf8");
