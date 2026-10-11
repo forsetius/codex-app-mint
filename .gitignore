@@ -1,2 +1,5 @@
 runtime/
 *.log
+.idea/
+/commit.txt
+/pr.md
